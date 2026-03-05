@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>India CO₂ Emissions Map</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+html,body{
+height:100%;
+margin:0;
+font-family:system-ui,-apple-system,BlinkMacSystemFont;
+}
+
+#map{
+height:100vh;
+width:100vw;
+}
+
+.legend{
+background:white;
+padding:10px;
+border-radius:6px;
+line-height:1.5;
+box-shadow:0 0 10px rgba(0,0,0,0.25);
+font-size:14px;
+}
+
+.legend span{
+display:inline-block;
+width:12px;
+height:12px;
+margin-right:6px;
+}
+
+/* ===== statistics panel ===== */
+
+#statsBox{
+
+position:absolute;
+bottom:20px;
+right:20px;
+
+width:340px;
+
+background:white;
+padding:12px;
+
+border-radius:8px;
+
+box-shadow:0 0 12px rgba(0,0,0,0.25);
+
+z-index:1000;
+
+font-size:13px;
+
+}
+
+#emissionChart{
+margin-top:10px;
+}
+
+</style>
+</head>
+
+<body>
+
+<div id="map"></div>
+
+<div id="statsBox">
+
+<strong>Emission Statistics</strong>
+
+<div id="minEmission"></div>
+<div id="maxEmission"></div>
+
+<canvas id="emissionChart"></canvas>
+
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+
+/* ================= MAP ================= */
+
+const map = L.map("map").setView([22.5,79],5);
+
+L.tileLayer(
+"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+{ attribution:"Tiles © Esri"}
+).addTo(map);
+
+
+/* ================= SECTORS ================= */
+
+const sectors = {
+
+Power:{file:"data/co2_emissions_2024_summary_power.csv",color:"#00bcd4"},
+Cement:{file:"data/co2_emissions_2024_summary_cement.csv",color:"#ff9800"},
+Steel:{file:"data/co2_emissions_2024_summary_steel.csv",color:"#9c27b0"},
+Refinery:{file:"data/co2_emissions_2024_summary_refinery.csv",color:"#4caf50"},
+Fertilisers:{file:"data/co2_emissions_2024_summary_fertilisers.csv",color:"#f44336"}
+
+};
+
+const layers = {};
+const sectorTotals = {};
+const sectorCounts = {};
+const sectorEmissions = {};
+
+const MIN_RADIUS = 3;
+const MAX_RADIUS = 30;
+
+
+/* ================= LOAD CSV ================= */
+
+function loadSector(sectorName,config){
+
+const layer = L.layerGroup();
+layers[sectorName] = layer;
+
+let sectorSum = 0;
+let plantCount = 0;
+let maxEmission = 0;
+
+sectorEmissions[sectorName] = [];
+
+Papa.parse(config.file,{
+
+download:true,
+header:true,
+dynamicTyping:true,
+
+complete:function(results){
+
+const validPlants = results.data.filter(row=>{
+const e=row.total_co2_emissions_2024;
+return row.lat && row.lon && e && e>0;
+});
+
+/* find max */
+
+validPlants.forEach(row=>{
+if(row.total_co2_emissions_2024 > maxEmission){
+maxEmission=row.total_co2_emissions_2024;
+}
+});
+
+
+/* create markers */
+
+validPlants.forEach(row=>{
+
+const emissions=row.total_co2_emissions_2024;
+
+sectorSum += emissions;
+plantCount++;
+
+sectorEmissions[sectorName].push(emissions);
+
+const radius =
+MIN_RADIUS +
+Math.sqrt(emissions/maxEmission)*(MAX_RADIUS-MIN_RADIUS);
+
+const marker=L.circleMarker(
+[row.lat,row.lon],
+{
+radius:radius,
+color:config.color,
+fillColor:config.color,
+fillOpacity:0.7,
+weight:0
+})
+
+.bindTooltip(
+`<strong>${row.source_name}</strong><br>
+CO₂ (2024): ${(emissions/1e6).toFixed(2)} Mt`,
+{direction:"top",offset:[0,-6],sticky:true})
+
+.bindPopup(
+`<strong>${row.source_name}</strong><br>
+Sector: ${sectorName}<br>
+CO₂ (2024): ${emissions.toLocaleString()} t`);
+
+marker.on("mouseover",function(){
+this.setStyle({weight:2,fillOpacity:0.9});
+});
+
+marker.on("mouseout",function(){
+this.setStyle({weight:0,fillOpacity:0.7});
+});
+
+marker.addTo(layer);
+
+});
+
+sectorTotals[sectorName]=sectorSum;
+sectorCounts[sectorName]=plantCount;
+
+layer.addTo(map);
+
+updateTotalCO2();
+updatePlantCount();
+updateEmissionStats();
+
+}
+
+});
+
+}
+
+
+/* load all sectors */
+
+Object.entries(sectors).forEach(([name,cfg])=>{
+loadSector(name,cfg);
+});
+
+
+/* ================= LAYER CONTROL ================= */
+
+const overlays={};
+
+Object.entries(sectors).forEach(([name,cfg])=>{
+overlays[`<span style="color:${cfg.color}">⬤</span> ${name}`]=layers[name];
+});
+
+L.control.layers(null,overlays,{collapsed:false}).addTo(map);
+
+
+/* ================= TOTAL CO2 ================= */
+
+const totalCO2Control=L.control({position:"bottomleft"});
+
+totalCO2Control.onAdd=function(){
+
+this._div=L.DomUtil.create("div","legend");
+this.update(0);
+return this._div;
+
+};
+
+totalCO2Control.update=function(totalTonnes){
+
+const mt=totalTonnes/1e6;
+
+this._div.innerHTML=
+`<strong>Total CO₂ (2024)</strong><br>
+${mt.toLocaleString(undefined,{maximumFractionDigits:2})} Mt`;
+
+};
+
+totalCO2Control.addTo(map);
+
+function updateTotalCO2(){
+
+let total=0;
+
+Object.keys(layers).forEach(sector=>{
+if(map.hasLayer(layers[sector])){
+total+=sectorTotals[sector]||0;
+}
+});
+
+totalCO2Control.update(total);
+
+}
+
+
+/* ================= PLANT COUNT ================= */
+
+const plantCountControl=L.control({position:"topright"});
+
+plantCountControl.onAdd=function(){
+
+this._div=L.DomUtil.create("div","legend");
+this.update(0);
+return this._div;
+
+};
+
+plantCountControl.update=function(count){
+
+this._div.innerHTML=
+`<strong>Total Plants</strong><br>
+${count.toLocaleString()}`;
+
+};
+
+plantCountControl.addTo(map);
+
+function updatePlantCount(){
+
+let count=0;
+
+Object.keys(layers).forEach(sector=>{
+if(map.hasLayer(layers[sector])){
+count+=sectorCounts[sector]||0;
+}
+});
+
+plantCountControl.update(count);
+
+}
+
+
+/* ================= EMISSION STATS ================= */
+
+let emissionChart;
+
+function updateEmissionStats(){
+
+let emissions=[];
+
+Object.keys(layers).forEach(sector=>{
+if(map.hasLayer(layers[sector])){
+emissions=emissions.concat(sectorEmissions[sector]||[]);
+}
+});
+
+if(emissions.length===0)return;
+
+const min=Math.min(...emissions);
+const max=Math.max(...emissions);
+
+/* min in tonnes */
+
+document.getElementById("minEmission").innerHTML=
+"Min: "+min.toLocaleString()+" t";
+
+/* max in Mt */
+
+document.getElementById("maxEmission").innerHTML=
+"Max: "+(max/1e6).toFixed(3)+" Mt";
+
+
+/* histogram */
+
+const bins=10;
+const step=(max-min)/bins;
+
+const histogram=new Array(bins).fill(0);
+const labels=[];
+
+for(let i=0;i<bins;i++){
+
+const start=min+i*step;
+const end=start+step;
+
+labels.push((start/1e6).toFixed(2));
+
+emissions.forEach(e=>{
+if(e>=start && e<end){
+histogram[i]++;
+}
+});
+
+}
+
+const ctx=document.getElementById("emissionChart");
+
+if(emissionChart){
+emissionChart.destroy();
+}
+
+emissionChart=new Chart(ctx,{
+
+type:"bar",
+
+data:{
+labels:labels,
+datasets:[{
+data:histogram,
+backgroundColor:"#2196f3"
+}]
+},
+
+options:{
+responsive:true,
+plugins:{legend:{display:false}},
+scales:{
+x:{title:{display:true,text:"Emission bins (Mt CO₂)"}},
+y:{title:{display:true,text:"Number of plants"}}
+}
+}
+
+});
+
+}
+
+
+/* ================= EVENTS ================= */
+
+map.on("overlayadd overlayremove",function(){
+
+updateTotalCO2();
+updatePlantCount();
+updateEmissionStats();
+
+});
+
+</script>
+
+</body>
+</html>
